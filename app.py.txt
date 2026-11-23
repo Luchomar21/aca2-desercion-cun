@@ -1,0 +1,179 @@
+import sqlite3
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
+import torch
+import torch.nn as nn
+
+# Configuración de página
+st.set_page_config(
+    page_title="Predictor de Deserción Estudiantil - CUN",
+    page_icon="🎓",
+    layout="wide"
+)
+
+# Definición exacta de la arquitectura ganadora (Ítem 3.3: Híbrido LSTM + MLP)
+class HybridLSTMNet(nn.Module):
+    def __init__(self, seq_dim, stat_dim):
+        super().__init__()
+        self.lstm = nn.LSTM(seq_dim, 24, batch_first=True)
+        self.stat_net = nn.Sequential(
+            nn.Linear(stat_dim, 48),
+            nn.BatchNorm1d(48),
+            nn.ReLU(),
+            nn.Dropout(0.4)
+        )
+        self.head = nn.Sequential(
+            nn.Linear(24 + 48, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(32, 3)
+        )
+
+    def forward(self, x_seq, x_stat):
+        _, (h_n, _) = self.lstm(x_seq)
+        return self.head(torch.cat([h_n[-1], self.stat_net(x_stat)], dim=1))
+
+@st.cache_resource
+def cargar_recursos():
+    art = joblib.load("artefactos_hibrido.joblib")
+    model = HybridLSTMNet(seq_dim=6, stat_dim=art["stat_dim"])
+    model.load_state_dict(torch.load("modelo_hibrido_lstm.pt", map_location=torch.device("cpu")))
+    model.eval()
+    return model, art
+
+def predecir_estudiante(df_fila, model, art):
+    s1 = art["scaler_sem"].transform(df_fila[art["sem1_cols"]].values)
+    s2 = art["scaler_sem"].transform(df_fila[art["sem2_cols"]].values)
+    x_seq = torch.tensor(np.stack([s1, s2], axis=1), dtype=torch.float32)
+    x_stat = torch.tensor(art["prep_stat"].transform(df_fila[art["static_features"]]), dtype=torch.float32)
+
+    with torch.no_grad():
+        logits = model(x_seq, x_stat)
+        probs = torch.softmax(logits, dim=1).numpy()[0]
+
+    clases = art["label_encoder"].classes_
+    pred_idx = int(np.argmax(probs))
+    return clases[pred_idx], dict(zip(clases, probs))
+
+# Cargar modelo y pipeline
+model, art = cargar_recursos()
+
+# Encabezado principal
+st.title("🎓 Sistema Inteligente de Predicción de Deserción Académica")
+st.markdown(
+    "**Especialización en Inteligencia Artificial - CUN | ACA N° 2 Aprendizaje Automático**  \n"
+    "Arquitectura desplegada: **Red Neuronal Híbrida (LSTM Secuencial + MLP Estático)**"
+)
+st.divider()
+
+tab1, tab2, tab3 = st.tabs([
+    "🔮 Simulador de Estudiante",
+    "🗄️ Consulta SQL en Vivo",
+    "📊 Comparativa de Arquitecturas"
+])
+
+# --- PESTAÑA 1: SIMULADOR INTERACTIVO ---
+with tab1:
+    st.subheader("Simulación de Trayectoria Académica y Financiera")
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("**1. Perfil Sociodemográfico y Financiero**")
+        edad = st.slider("Edad al matricularse", 17, 65, 20)
+        nota_admision = st.slider("Nota de admisión (95 - 190)", 95.0, 190.0, 128.0, step=0.5)
+        matricula_dia = st.selectbox("¿Matrícula al día?", [1, 0], format_func=lambda x: "Sí (Al día)" if x == 1 else "No (Atrasada)")
+        deudor = st.selectbox("¿Tiene deudas vigentes?", [0, 1], format_func=lambda x: "No" if x == 0 else "Sí (Deudor)")
+        becado = st.selectbox("¿Tiene beca?", [0, 1], format_func=lambda x: "No" if x == 0 else "Sí (Becado)")
+
+    with col2:
+        st.markdown("**2. Desempeño 1er Semestre (Paso t₁)**")
+        insc_1 = st.number_input("Materias inscritas (1° Sem)", 0, 20, 6)
+        aprob_1 = st.number_input("Materias aprobadas (1° Sem)", 0, 20, 5)
+        nota_1 = st.slider("Promedio 1° Semestre (0 - 20)", 0.0, 20.0, 12.5, step=0.1)
+
+    with col3:
+        st.markdown("**3. Desempeño 2do Semestre (Paso t₂)**")
+        insc_2 = st.number_input("Materias inscritas (2° Sem)", 0, 20, 6)
+        aprob_2 = st.number_input("Materias aprobadas (2° Sem)", 0, 20, 5)
+        nota_2 = st.slider("Promedio 2° Semestre (0 - 20)", 0.0, 20.0, 12.8, step=0.1)
+
+    if st.button("Predecir Estado Académico", type="primary", use_container_width=True):
+        datos_sim = art["defaults"].copy()
+        datos_sim.update({
+            "Age at enrollment": edad,
+            "Admission grade": nota_admision,
+            "Tuition fees up to date": matricula_dia,
+            "Debtor": deudor,
+            "Scholarship holder": becado,
+            "Curricular units 1st sem (enrolled)": insc_1,
+            "Curricular units 1st sem (approved)": aprob_1,
+            "Curricular units 1st sem (grade)": nota_1,
+            "Curricular units 2nd sem (enrolled)": insc_2,
+            "Curricular units 2nd sem (approved)": aprob_2,
+            "Curricular units 2nd sem (grade)": nota_2,
+        })
+        df_input = pd.DataFrame([datos_sim])[art["all_features"]]
+        clase_pred, probs = predecir_estudiante(df_input, model, art)
+
+        st.divider()
+        r1, r2 = st.columns([1, 2])
+        with r1:
+            if clase_pred == "Dropout":
+                st.error(f"### Riesgo Alto: {clase_pred}\nAlta probabilidad de deserción académica.")
+            elif clase_pred == "Enrolled":
+                st.warning(f"### Estado: {clase_pred}\nEstudiante continúa activo; requiere seguimiento.")
+            else:
+                st.success(f"### Estado: {clase_pred}\nTrayectoria favorable hacia la graduación.")
+
+        with r2:
+            df_probs = pd.DataFrame({
+                "Estado": list(probs.keys()),
+                "Probabilidad": [round(v * 100, 2) for v in probs.values()]
+            }).set_index("Estado")
+            st.bar_chart(df_probs)
+
+# --- PESTAÑA 2: CONSULTA DESDE SQLITE ---
+with tab2:
+    st.subheader("Auditoría de Registros desde Base de Datos SQLite")
+    try:
+        conn = sqlite3.connect("desercion_academica.db")
+        student_id = st.number_input("Seleccione el ID del Estudiante (1 a 4424)", min_value=1, max_value=4424, value=1)
+        query = f"""
+        SELECT s.*, a.*, m.*
+        FROM perfil_sociodemografico s
+        JOIN historial_academico a ON s.student_id = a.student_id
+        JOIN contexto_macroeconomico m ON s.student_id = m.student_id
+        WHERE s.student_id = {int(student_id)}
+        """
+        df_sql = pd.read_sql_query(query, conn)
+        conn.close()
+        df_sql = df_sql.loc[:, ~df_sql.columns.duplicated()]
+
+        real_target = df_sql["Target"].iloc[0]
+        pred_sql, probs_sql = predecir_estudiante(df_sql[art["all_features"]], model, art)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Estado Real (BD SQL)", real_target)
+        c2.metric("Predicción Red Neuronal", pred_sql)
+        c3.metric("Confianza Predicción", f"{probs_sql[pred_sql]*100:.1f}%")
+
+        st.dataframe(df_sql[[
+            "student_id", "Age at enrollment", "Tuition fees up to date", "Debtor",
+            "Scholarship holder", "Curricular units 1st sem (grade)",
+            "Curricular units 2nd sem (grade)", "Target"
+        ]], use_container_width=True)
+    except Exception as e:
+        st.info("Asegúrate de tener el archivo 'desercion_academica.db' en el mismo directorio que app.py.")
+
+# --- PESTAÑA 3: RESUMEN EXPERIMENTAL ---
+with tab3:
+    st.subheader("Resultados Comparativos en Conjunto de Prueba (n = 664)")
+    df_metricas = pd.DataFrame([
+        {"Ítem / Arquitectura": "3.1 MLP Profundo", "Parámetros": 17347, "Val Loss": 0.7206, "Accuracy": "78.16%", "F1 Macro": 0.7482, "F1 Weighted": 0.7900},
+        {"Ítem / Arquitectura": "3.2 Red Convolucional 1D (CNN)", "Parámetros": 20931, "Val Loss": 0.7411, "Accuracy": "75.60%", "F1 Macro": 0.7169, "F1 Weighted": 0.7667},
+        {"Ítem / Arquitectura": "3.3 Híbrido LSTM + MLP (Seleccionado)", "Parámetros": 16323, "Val Loss": 0.7022, "Accuracy": "78.31%", "F1 Macro": 0.7509, "F1 Weighted": 0.7932},
+    ])
+    st.table(df_metricas)
